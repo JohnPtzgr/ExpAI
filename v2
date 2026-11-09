@@ -1,0 +1,606 @@
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+import numpy as np
+from typing import List
+import time
+
+tf.random.set_seed(42)
+np.random.seed(42)
+verbose = True
+
+
+# ============================================================================
+# REGULARIZATION LOSS FUNCTIONS
+# ============================================================================
+
+def f_valve(a):
+    """
+    f(a) = ((a² - a)²) × (((1-a) × 13.1 - 2.2)² + 20)²
+    Minima at a=0 and a=1, with steep bias toward a=0
+    """
+    term1 = (a ** 2 - a) ** 2  # = a²(a-1)²
+    term2 = ((1 - a) * 13.1 - 2.2) ** 2 + 20
+    return term1 * (term2 ** 2)
+
+
+def lossD(a, b, c):
+    """
+    Sparsity + discreteness penalty
+    lossD = (f(a) + f(b) + f(c) + f(1-a-b-c)) / 100
+    """
+    s = 1 - a - b - c
+    return (f_valve(a) + f_valve(b) + f_valve(c) + f_valve(s)) / 100.0
+
+
+def lossU(a, b, c):
+    """
+    Uniqueness penalty
+    lossU = ((a² + b² + c² + (1-a-b-c)² - 1)²) / 10
+    """
+    s = 1 - a - b - c
+    sum_sq = a ** 2 + b ** 2 + c ** 2 + s ** 2
+    return ((sum_sq - 1) ** 2) / 10.0
+
+
+# ============================================================================
+# DIFFERENTIABLE VALVE LAYER WITH CONTINUOUS A,B,C
+# ============================================================================
+
+class ValveLayer(layers.Layer):
+    """
+    Layer with 2-bit valves using continuous a,b,c weights.
+    During training: uses continuous values (a,b,c) with regularization.
+    During inference: converts to discrete {-1,0,1,2}.
+    """
+
+    def __init__(self, units, name=None):
+        super().__init__(name=name)
+        self.units = units
+        self.input_dim = None
+
+        # Continuous weights for each valve type (will be sigmoided to [0,1])
+        self.a_raw = None  # weight for -1
+        self.b_raw = None  # weight for 1
+        self.c_raw = None  # weight for 2
+
+    def build(self, input_shape):
+        self.input_dim = input_shape[-1]
+
+        shape = (self.units, self.input_dim)
+
+        # Initialize to small negative values (near zero after sigmoid)
+        # This biases toward zero valve initially
+        self.a_raw = self.add_weight(
+            name="a_raw",
+            shape=shape,
+            initializer=tf.random_normal_initializer(stddev=0.1, seed=42),
+            trainable=True,
+            dtype=tf.float32
+        )
+
+        self.b_raw = self.add_weight(
+            name="b_raw",
+            shape=shape,
+            initializer=tf.random_normal_initializer(stddev=0.1, seed=42, mean=1),
+            trainable=True,
+            dtype=tf.float32
+        )
+
+        self.c_raw = self.add_weight(
+            name="c_raw",
+            shape=shape,
+            initializer=tf.random_normal_initializer(stddev=0.1, seed=42),
+            trainable=True,
+            dtype=tf.float32
+        )
+
+        super().build(input_shape)
+
+    def get_abc(self):
+        """Get a,b,c constrained to [0,1] via sigmoid"""
+        a = tf.sigmoid(self.a_raw)
+        b = tf.sigmoid(self.b_raw)
+        c = tf.sigmoid(self.c_raw)
+        return a, b, c
+
+    def get_valve_value(self):
+        """Compute effective valve value = -a + b + 2c"""
+        a, b, c = self.get_abc()
+        return -a + b + 2 * c
+
+    def get_hard_valve(self):
+        """Convert to discrete {-1,0,1,2} for inference/stats"""
+        a, b, c = self.get_abc()
+        s = 1 - a - b - c
+
+        # Find which is largest
+        # Using one-hot style selection
+        max_val = tf.maximum(tf.maximum(a, b), tf.maximum(c, s))
+
+        valve = tf.zeros_like(a)
+        valve = tf.where(tf.equal(max_val, a), -1.0 * tf.ones_like(a), valve)
+        valve = tf.where(tf.equal(max_val, b), 1.0 * tf.ones_like(a), valve)
+        valve = tf.where(tf.equal(max_val, c), 2.0 * tf.ones_like(a), valve)
+        # If s is largest, valve remains 0
+
+        return valve
+
+    def call(self, inputs, training=None):
+        """Forward pass using continuous valve computation"""
+        a, b, c = self.get_abc()
+
+        # 3-group accumulation using continuous values
+        # This is fully differentiable because a,b,c are continuous
+        sum_m1 = tf.matmul(inputs, -a, transpose_b=True)  # contribution from -1
+        sum_1 = tf.matmul(inputs, b, transpose_b=True)  # contribution from 1
+        sum_2 = tf.matmul(inputs, 2 * c, transpose_b=True)  # contribution from 2
+
+        S = sum_m1 + sum_1 + sum_2
+
+        # Count non-zero using continuous approximation
+        nonzero_prob = a + b + c
+        n_nonzero = tf.reduce_sum(nonzero_prob, axis=1)
+        n_nonzero = tf.maximum(n_nonzero, 1.0)
+        n_nonzero = tf.expand_dims(n_nonzero, axis=0)
+
+        return S / n_nonzero
+
+    def get_regularization_loss(self):
+        """Compute lossD and lossU for this layer"""
+        a, b, c = self.get_abc()
+
+        # Average over all connections
+        loss_d = tf.reduce_mean(lossD(a, b, c))
+        loss_u = tf.reduce_mean(lossU(a, b, c))
+
+        return loss_d, loss_u
+
+    def get_stats(self):
+        """Print distribution of hard valves"""
+        w_hard = self.get_hard_valve()
+
+        total = tf.size(w_hard).numpy()
+        print(f"    Total valves: {total:,}")
+        for val in [-1, 0, 1, 2]:
+            count = tf.reduce_sum(tf.cast(tf.equal(w_hard, val), tf.int32)).numpy()
+            print(f"    {val:2d}: {100.0 * count / total:5.1f}%")
+
+
+# ============================================================================
+# NEURON LAYER WITH AMPLIFIERS
+# ============================================================================
+
+class NeuronLayer(layers.Layer):
+    """
+    Neuron layer with continuous valves and per-neuron amplifiers.
+    """
+
+    def __init__(self, units, activation=tf.nn.relu, name=None):
+        super().__init__(name=name)
+        self.units = units
+        self.activation = activation
+
+        self.valve_layer = None
+        self.weight_in = None
+        self.bias = None
+        self.weight_out = None
+
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+
+        self.valve_layer = ValveLayer(
+            self.units,
+            name=f"{self.name}_valves"
+        )
+        self.valve_layer.build(input_shape)
+
+        self.weight_in = self.add_weight(
+            name="weight_in",
+            shape=(self.units,),
+            initializer=tf.ones_initializer(),
+            trainable=True,
+            dtype=tf.float32
+        )
+
+        self.bias = self.add_weight(
+            name="bias",
+            shape=(self.units,),
+            initializer=tf.zeros_initializer(),
+            trainable=True,
+            dtype=tf.float32
+        )
+
+        self.weight_out = self.add_weight(
+            name="weight_out",
+            shape=(self.units,),
+            initializer=tf.ones_initializer(),
+            trainable=True,
+            dtype=tf.float32
+        )
+
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        # Routing (continuous, differentiable)
+        routed = self.valve_layer(inputs, training=training)
+
+        # Input amplification
+        scaled = routed * tf.expand_dims(self.weight_in, axis=0)
+
+        # Bias
+        biased = scaled + tf.expand_dims(self.bias, axis=0)
+
+        # Activation
+        if self.activation:
+            activated = self.activation(biased)
+        else:
+            activated = biased
+
+        # Output amplification
+        output = activated * tf.expand_dims(self.weight_out, axis=0)
+
+        return output
+
+    def get_regularization_loss(self):
+        """Get regularization loss from valve layer"""
+        return self.valve_layer.get_regularization_loss()
+
+    def get_stats(self):
+        print(f"\n  Layer {self.name}:")
+        print("    Valves (WT):")
+        self.valve_layer.get_stats()
+
+        w_in = self.weight_in.numpy()
+        w_out = self.weight_out.numpy()
+        b = self.bias.numpy()
+
+        print(f"    weight_in: mean={w_in.mean():.4f}, std={w_in.std():.4f}, "
+              f"min={w_in.min():.4f}, max={w_in.max():.4f}")
+        print(f"    weight_out: mean={w_out.mean():.4f}, std={w_out.std():.4f}, "
+              f"min={w_out.min():.4f}, max={w_out.max():.4f}")
+        print(f"    bias: mean={b.mean():.4f}, std={b.std():.4f}")
+
+
+# ============================================================================
+# NETWORK WITH REGULARIZATION
+# ============================================================================
+
+class SimpleValveNetwork(Model):
+    """
+    Simple feedforward network using valve-based routing with custom regularization.
+    """
+
+    def __init__(
+            self,
+            input_dim: int,
+            hidden_dims: List[int],
+            output_dim: int,
+            activation=tf.nn.relu,
+            name: str = "valve_network"
+    ):
+        super().__init__(name=name)
+
+        self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
+        self.output_dim = output_dim
+
+        # Hidden layers
+        self.hidden_layers = []
+        prev_dim = input_dim
+
+        for i, dim in enumerate(hidden_dims):
+            layer = NeuronLayer(
+                units=dim,
+                activation=activation,
+                name=f"hidden_{i}"
+            )
+            layer.build((None, prev_dim))
+            self.hidden_layers.append(layer)
+            prev_dim = dim
+
+        # Output layer
+        self.output_layer = NeuronLayer(
+            units=output_dim,
+            activation=None,
+            name="output"
+        )
+        self.output_layer.build((None, prev_dim))
+
+    def call(self, inputs, training=None):
+        x = tf.reshape(inputs, (-1, self.input_dim))
+
+        for layer in self.hidden_layers:
+            x = layer(x, training=training)
+
+        logits = self.output_layer(x, training=training)
+
+        return logits
+
+    def compute_regularization_loss(self):
+        """Compute total regularization loss from all valve layers"""
+        total_loss_d = 0.0
+        total_loss_u = 0.0
+        num_layers = 0
+
+        for layer in self.hidden_layers:
+            loss_d, loss_u = layer.get_regularization_loss()
+            total_loss_d += loss_d
+            total_loss_u += loss_u
+            num_layers += 1
+
+        loss_d, loss_u = self.output_layer.get_regularization_loss()
+        total_loss_d += loss_d
+        total_loss_u += loss_u
+        num_layers += 1
+
+        # Average over layers
+        return total_loss_d / tf.cast(num_layers, tf.float32), total_loss_u / tf.cast(num_layers, tf.float32)
+
+    def get_network_stats(self):
+        print("\n" + "=" * 70)
+        print("NETWORK STATISTICS")
+        print("=" * 70)
+
+        print(f"\nArchitecture:")
+        print(f"  Input dim: {self.input_dim}")
+        for i, dim in enumerate(self.hidden_dims):
+            print(f"  Hidden layer {i}: {dim} neurons")
+        print(f"  Output dim: {self.output_dim}")
+
+        print("\n" + "-" * 70)
+        print("HIDDEN LAYERS:")
+        for layer in self.hidden_layers:
+            layer.get_stats()
+
+        print("\n" + "-" * 70)
+        print("OUTPUT LAYER:")
+        self.output_layer.get_stats()
+        print("=" * 70 + "\n")
+
+
+# ============================================================================
+# TRAINING UTILITIES WITH CUSTOM LOSS
+# ============================================================================
+
+def create_mnist_datasets(batch_size=128):
+    """Create MNIST datasets"""
+    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+
+    x_train = x_train.reshape(-1, 784).astype(np.float32)
+    x_train = (x_train / 127.5) - 1.0
+    x_test = x_test.reshape(-1, 784).astype(np.float32)
+    x_test = (x_test / 127.5) - 1.0
+
+    train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    train_ds = train_ds.shuffle(10000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test))
+    test_ds = test_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    return train_ds, test_ds
+
+
+def get_regularization_coefficients(epoch, max_epochs=30):
+    """
+    Regularization coefficients increase over time.
+    Start very small, end at target strength.
+    """
+    progress = epoch / max_epochs
+
+    # alpha for lossD (sparsity), beta for lossU (uniqueness)
+    alpha = 0.00001 + 0.00005 * progress  # 0.001 → 0.011
+    beta = 0.02 + 0.04 * progress  # 0.0001 → 0.0011
+
+    return alpha, beta
+
+
+def print_progress_bar(epoch, total_epochs, batch, total_batches, loss, accuracy, width=50):
+    """
+    Display a progress bar during training.
+
+    Args:
+        epoch: Current epoch number
+        total_epochs: Total number of epochs
+        batch: Current batch number
+        total_batches: Total batches per epoch
+        loss: Current loss value
+        accuracy: Current accuracy value
+        width: Width of the progress bar in characters
+    """
+    # Calculate progress percentage
+    progress = batch / total_batches
+    filled = int(width * progress)
+    bar = '█' * filled + '░' * (width - filled)
+
+    # Calculate epoch progress percentage
+    epoch_progress = epoch / total_epochs
+    epoch_filled = int(width * epoch_progress)
+    epoch_bar = '█' * epoch_filled + '░' * (width - epoch_filled)
+
+    # Clear line and print progress
+    print(f'\rEpoch {epoch}/{total_epochs} [{epoch_bar}] '
+          f'Batch {batch}/{total_batches} [{bar}] '
+          f'Loss: {loss:.4f} Acc: {accuracy:.4f}',
+          end='', flush=True)
+
+    # Print newline at the end of epoch
+    if batch == total_batches:
+        print()
+
+
+def train_epoch(model, train_ds, optimizer, epoch, max_epochs=30, verbose=True):
+    """Train for one epoch with custom regularization loss"""
+    train_loss_ce = tf.keras.metrics.Mean()
+    train_loss_reg_d = tf.keras.metrics.Mean()
+    train_loss_reg_u = tf.keras.metrics.Mean()
+    train_acc = tf.keras.metrics.SparseCategoricalAccuracy()
+
+    # Get regularization coefficients for this epoch
+    alpha, beta = get_regularization_coefficients(epoch, max_epochs)
+
+    for i, (batch_x, batch_y) in enumerate(train_ds):
+        with tf.GradientTape() as tape:
+            # Forward pass
+            logits = model(batch_x, training=True)
+
+            # Cross-entropy loss
+            ce_loss = tf.reduce_mean(
+                tf.keras.losses.sparse_categorical_crossentropy(batch_y, logits, from_logits=True)
+            )
+
+            # Regularization losses
+            loss_d, loss_u = model.compute_regularization_loss()
+
+            # Total loss
+            total_loss = ce_loss * (1 + alpha * loss_d) + beta * loss_u
+
+        # Compute gradients and update
+        grads = tape.gradient(total_loss, model.trainable_variables)
+
+        # Clip gradients for stability
+        grads = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in grads]
+
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+
+        # Update metrics
+        train_loss_ce.update_state(ce_loss)
+        train_loss_reg_d.update_state(loss_d)
+        train_loss_reg_u.update_state(loss_u)
+        train_acc.update_state(batch_y, logits)
+        # Inside train_epoch, after computing loss and accuracy:
+        if verbose:
+            print_progress_bar(
+                epoch=epoch,
+                total_epochs=max_epochs,
+                batch=i + 1,
+                total_batches=len(train_ds),
+                loss=total_loss,
+                accuracy=train_acc.result().numpy(),
+                width=40
+            )
+
+    return train_loss_ce.result().numpy(), train_loss_reg_d.result().numpy(), \
+           train_loss_reg_u.result().numpy(), train_acc.result().numpy()
+
+
+def evaluate(model, test_ds):
+    """Evaluate model"""
+    test_acc = tf.keras.metrics.SparseCategoricalAccuracy()
+
+    # Also compute regularization losses for reporting
+    total_loss_d = 0.0
+    total_loss_u = 0.0
+    num_batches = 0
+
+    for batch_x, batch_y in test_ds:
+        logits = model(batch_x, training=False)
+        test_acc.update_state(batch_y, logits)
+
+        loss_d, loss_u = model.compute_regularization_loss()
+        total_loss_d += loss_d
+        total_loss_u += loss_u
+        num_batches += 1
+
+    return (test_acc.result().numpy(),
+            total_loss_d / num_batches,
+            total_loss_u / num_batches)
+
+
+# ============================================================================
+# MAIN TRAINING SCRIPT
+# ============================================================================
+
+def main():
+    print("=" * 70)
+    print("VALVE NETWORK - CUSTOM REGULARIZATION LOSS")
+    print("=" * 70)
+
+    # Hyperparameters
+    BATCH_SIZE = 128
+    EPOCHS = 30
+    LEARNING_RATE = 0.001
+
+    # Create datasets
+    print("\nLoading MNIST data...")
+    train_ds, test_ds = create_mnist_datasets(batch_size=BATCH_SIZE)
+
+    # Create network
+    network = SimpleValveNetwork(
+        input_dim=784,
+        hidden_dims=[256, 128, 64],
+        output_dim=10,
+        activation=tf.nn.relu
+    )
+
+    # Build the network
+    dummy_input = tf.zeros((1, 784))
+    _ = network(dummy_input, training=False)
+
+    # Print network statistics
+    network.get_network_stats()
+
+    # Count total parameters
+    total_params = sum(tf.size(v).numpy() for v in network.trainable_variables)
+    print(f"Total trainable parameters: {total_params:,}")
+
+    # Optimizer with legacy Adam
+    optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=LEARNING_RATE)
+
+    # Training loop
+    print("\n" + "=" * 70)
+    print("STARTING TRAINING")
+    print("=" * 70)
+
+    train_accs = []
+    test_accs = []
+
+    for epoch in range(1, EPOCHS + 1):
+        start_time = time.time()
+
+        # Train
+        train_ce, train_reg_d, train_reg_u, train_acc = train_epoch(
+            network, train_ds, optimizer, epoch, max_epochs=EPOCHS
+        )
+        train_accs.append(train_acc)
+
+        # Evaluate
+        test_acc, test_reg_d, test_reg_u = evaluate(network, test_ds)
+        test_accs.append(test_acc)
+
+        epoch_time = time.time() - start_time
+
+        # Get coefficients for display
+        alpha, beta = get_regularization_coefficients(epoch, EPOCHS)
+
+        print(f"Epoch {epoch:2d}: "
+              f"CE={train_ce:.4f}, "
+              f"RegD={train_reg_d:.4f}, "
+              f"RegU={train_reg_u:.4f}, "
+              f"Train Acc={train_acc:.4f}, "
+              f"Test Acc={test_acc:.4f}, "
+              f"α={alpha:.4f}, β={beta:.4f}, "
+              f"Time={epoch_time:.1f}s")
+
+        # Print statistics every 5 epochs
+        if epoch % 5 == 0:
+            network.get_network_stats()
+
+            # Also print regularization loss components
+            print(f"\n  Regularization Summary at Epoch {epoch}:")
+            print(f"    lossD (train): {train_reg_d:.6f}, lossU (train): {train_reg_u:.6f}")
+            print(f"    lossD (test):  {test_reg_d:.6f}, lossU (test):  {test_reg_u:.6f}")
+
+    # Final results
+    print("\n" + "=" * 70)
+    print("TRAINING COMPLETE")
+    print("=" * 70)
+    print(f"Best test accuracy: {max(test_accs):.4f} ({max(test_accs) * 100:.2f}%)")
+    print(f"Final test accuracy: {test_accs[-1]:.4f} ({test_accs[-1] * 100:.2f}%)")
+
+    network.get_network_stats()
+
+    return network, train_accs, test_accs
+
+
+if __name__ == "__main__":
+    network, train_accs, test_accs = main()
