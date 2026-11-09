@@ -1,0 +1,761 @@
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+import numpy as np
+from typing import List
+import math
+import random
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+tf.random.set_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+
+# ============================================================================
+# VALVE ENCODING UTILITIES
+# ============================================================================
+
+def get_valve_values(valve_bits=4):
+    """
+    Get all possible multiplier values for given bit width using exponential encoding.
+
+    For valve_bits=4: returns [-8, -4, -2, -1, -0.5, -0.25, -0.125, 0,
+                                0.125, 0.25, 0.5, 1, 2, 4, 8, 16]
+    """
+    bias = 2 ** (valve_bits - 2)
+    max_val = 2 ** (valve_bits - 1)
+
+    values = []
+    # Negative values
+    for x in range(-max_val + 1, 0):
+        exp = abs(x) - bias
+        values.append(-(2.0 ** exp))
+    # Zero
+    values.append(0.0)
+    # Positive values
+    for x in range(1, max_val + 1):
+        exp = x - bias
+        values.append(2.0 ** exp)
+
+    return values
+
+
+def get_random_valve_value(valve_bits=4, sparsity=0.7):
+    """
+    Generate a random valve value.
+
+    Args:
+        valve_bits: Bit width for valve encoding
+        sparsity: Probability of zero (0 = no connections, 1 = all connections)
+    """
+    if random.random() < sparsity:
+        return 0
+
+    bias = 2 ** (valve_bits - 2)
+    max_val = 2 ** (valve_bits - 1)
+
+    exponent = random.randint(1, max_val)
+    sign = 1 if random.random() < 0.5 else -1
+    int_val = sign * exponent * 8
+
+    return int_val
+
+
+def get_annealed_alpha(step, alpha0=0.5, K=5):
+    """Annealed learning rate: α_k = α₀ / (1 + k/K)"""
+    return alpha0 / (1 + step / K)
+
+
+def probabilistic_valve_update(valve_int, gradient, alpha=0.5, temperature=1.0, max_valve=8):
+    """
+    Compute probabilistic update for a single valve.
+    """
+    if valve_int == 0:
+        return valve_int, False
+
+    x = abs(valve_int) // 8
+    sign = 1 if valve_int > 0 else -1
+
+    if gradient > 0:
+        prob = min(1.0, alpha * gradient / (x * temperature))
+        if random.random() < prob:
+            new_x = min(x * 2, max_valve)
+            new_valve = sign * new_x * 8
+            return new_valve, True
+    elif gradient < 0:
+        prob = min(1.0, -2 * alpha * gradient / (x * temperature))
+        if random.random() < prob:
+            new_x = max(x // 2, 1)
+            new_valve = sign * new_x * 8
+            return new_valve, True
+
+    return valve_int, False
+
+
+# ============================================================================
+# PROBABILISTIC VALVE LAYER
+# ============================================================================
+
+class ProbabilisticValveLayer(layers.Layer):
+    """
+    Sparse valve layer with probabilistic gradient-based updates.
+    """
+
+    def __init__(self, units, input_dim, valve_bits=4, initial_sparsity=0.7, name=None):
+        super().__init__(name=name)
+        self.units = units
+        self.input_dim = input_dim
+        self.valve_bits = valve_bits
+        self.initial_sparsity = initial_sparsity
+        self.bias = 2 ** (valve_bits - 2)
+        self.max_valve = 2 ** (valve_bits - 1)
+
+        self.valve_values = tf.constant(get_valve_values(valve_bits), dtype=tf.float32)
+
+        # Valve matrices
+        self.num_valve_positions = 1
+        self.valves = []
+
+        for pos in range(self.num_valve_positions):
+            init_values = []
+            for _ in range(units * input_dim):
+                init_values.append(get_random_valve_value(valve_bits, initial_sparsity))
+
+            init_tensor = tf.constant(init_values, dtype=tf.int32)
+            init_tensor = tf.reshape(init_tensor, (units, input_dim))
+
+            valve_var = self.add_weight(
+                name=f'valves_{pos}',
+                shape=(units, input_dim),
+                initializer=tf.constant_initializer(init_tensor.numpy()),
+                trainable=False,
+                dtype=tf.int32
+            )
+            self.valves.append(valve_var)
+
+        # Update state
+        self.update_counters = self.add_weight(
+            name='update_counters',
+            shape=(units, input_dim),
+            initializer=tf.zeros_initializer(),
+            trainable=False,
+            dtype=tf.float32
+        )
+        self.thresholds = self.add_weight(
+            name='thresholds',
+            shape=(units, input_dim),
+            initializer=tf.ones_initializer(),
+            trainable=False,
+            dtype=tf.float32
+        )
+
+        # Per-neuron amplifiers
+        self.weight_in = self.add_weight(
+            name='weight_in',
+            shape=(units,),
+            initializer=tf.random_normal_initializer(stddev=0.1, seed=42),
+            trainable=True,
+            dtype=tf.float32
+        )
+        self.bias_neuron = self.add_weight(
+            name='bias',
+            shape=(units,),
+            initializer=tf.zeros_initializer(),
+            trainable=True,
+            dtype=tf.float32
+        )
+        self.weight_out = self.add_weight(
+            name='weight_out',
+            shape=(units,),
+            initializer=tf.ones_initializer(),
+            trainable=True,
+            dtype=tf.float32
+        )
+
+        self.step_counter = 0
+        self.update_frequency = 100
+
+    def get_multiplier_matrix(self, valve_matrix):
+        """Convert integer valve matrix to float multiplier matrix."""
+        multiplier = tf.zeros_like(valve_matrix, dtype=tf.float32)
+
+        for val in get_valve_values(self.valve_bits):
+            int_val = int(val * 8)
+            mask = tf.cast(tf.equal(valve_matrix, int_val), tf.float32)
+            multiplier = multiplier + mask * val
+
+        return multiplier
+
+    def compute_routed_signal(self, inputs):
+        """Compute routed signal: Σ (valve_multiplier × input) / n_nonzero"""
+        batch_size = tf.shape(inputs)[0]
+        S = tf.zeros((batch_size, self.units), dtype=tf.float32)
+        total_nonzero = tf.zeros((self.units,), dtype=tf.float32)
+
+        for valve_matrix in self.valves:
+            multiplier = self.get_multiplier_matrix(valve_matrix)
+            S = S + tf.matmul(inputs, multiplier, transpose_b=True)
+            nonzero_per_neuron = tf.reduce_sum(tf.cast(tf.not_equal(valve_matrix, 0), tf.float32), axis=1)
+            total_nonzero = total_nonzero + nonzero_per_neuron
+
+        total_nonzero = tf.maximum(total_nonzero, 1.0)
+        total_nonzero = tf.reshape(total_nonzero, (1, self.units))
+
+        return S / total_nonzero
+
+    def call(self, inputs, training=None):
+        routed = self.compute_routed_signal(inputs)
+        scaled = routed * tf.expand_dims(self.weight_in, axis=0)
+        biased = scaled + tf.expand_dims(self.bias_neuron, axis=0)
+        activated = tf.tanh(biased)
+        output = activated * tf.expand_dims(self.weight_out, axis=0)
+
+        return output
+
+    def get_valve_stats(self):
+        """Print valve statistics."""
+        total_connections = 0
+        total_valves = 0
+
+        for valve_matrix in self.valves:
+            valve_np = valve_matrix.numpy()
+            total_connections += valve_np.size
+            total_valves += np.sum(valve_np != 0)
+
+        sparsity = 100.0 * (1 - total_valves / max(total_connections, 1))
+
+        print(f"    Active valves: {total_valves:,} / {total_connections:,} ({sparsity:.1f}% sparse)")
+        print(f"    weight_in: mean={self.weight_in.numpy().mean():.4f}, std={self.weight_in.numpy().std():.4f}")
+        print(f"    weight_out: mean={self.weight_out.numpy().mean():.4f}, std={self.weight_out.numpy().std():.4f}")
+        print(f"    bias: mean={self.bias_neuron.numpy().mean():.4f}, std={self.bias_neuron.numpy().std():.4f}")
+
+
+# ============================================================================
+# VALVE NETWORK
+# ============================================================================
+
+class ValveNetwork(Model):
+    """Complete network with probabilistic valve layers."""
+
+    def __init__(
+            self,
+            input_dim: int,
+            hidden_dims: List[int],
+            num_classes: int,
+            valve_bits: int = 4,
+            initial_sparsity: float = 0.7,
+            name: str = "valve_network"
+    ):
+        super().__init__(name=name)
+
+        self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
+        self.num_classes = num_classes
+        self.valve_bits = valve_bits
+
+        self.layers_list = []
+        prev_dim = input_dim
+
+        for i, dim in enumerate(hidden_dims):
+            layer = ProbabilisticValveLayer(
+                units=dim,
+                input_dim=prev_dim,
+                valve_bits=valve_bits,
+                initial_sparsity=initial_sparsity,
+                name=f"valve_layer_{i}"
+            )
+            self.layers_list.append(layer)
+            prev_dim = dim
+
+        self.classifier = tf.keras.layers.Dense(num_classes, name="classifier")
+
+    def call(self, inputs, training=None):
+        x = tf.reshape(inputs, (-1, self.input_dim))
+        x = (x - 0.5) * 2
+
+        for layer in self.layers_list:
+            x = layer(x, training=training)
+
+        return self.classifier(x, training=training)
+
+    def get_stats(self):
+        print("\n" + "=" * 60)
+        print("VALVE NETWORK STATISTICS")
+        print("=" * 60)
+        for i, layer in enumerate(self.layers_list):
+            print(f"\nLayer {i}:")
+            layer.get_valve_stats()
+        print("=" * 60 + "\n")
+
+
+# ============================================================================
+# PROBABILISTIC VALVE UPDATER
+# ============================================================================
+
+class ProbabilisticValveUpdater:
+    """
+    Handles probabilistic valve updates with epoch-based annealing and momentum.
+
+    Features:
+    - Update frequency increases over epochs (fewer updates as training progresses)
+    - Temperature decreases over epochs (less exploration over time)
+    - Update ratio decreases over epochs (change fewer valves)
+    - Learning rate decays with each update
+    - Momentum accumulates gradient direction for smoother updates
+    - Safe handling of temperature (never reaches zero)
+    """
+
+    def __init__(self, model, alpha0=0.5, K=5, momentum=0.9,
+                 initial_frequency=50, max_frequency=500):
+        """
+        Args:
+            model: The valve network containing valve layers
+            alpha0: Initial learning rate for valve updates
+            K: Decay constant for learning rate (α_k = α₀ / (1 + k/K))
+            momentum: Momentum coefficient for gradient accumulation (0.9 typical)
+            initial_frequency: Batches between updates at start of training
+            max_frequency: Batches between updates at end of training
+        """
+        self.model = model
+        self.alpha0 = alpha0
+        self.K = K
+        self.momentum = momentum
+        self.initial_frequency = initial_frequency
+        self.max_frequency = max_frequency
+
+        # State tracking
+        self.epoch = 0
+        self.update_count = 0
+        self.batch_in_epoch = 0
+
+        # Current schedule values
+        self.current_frequency = initial_frequency
+        self.current_temperature = 1.0
+        self.current_update_ratio = 0.3
+        self.current_alpha = alpha0
+
+        # Momentum storage for each valve
+        self.momentums = {}  # key: (layer_idx, valve_idx, i, j)
+
+        # Loss history for gradient estimation
+        self.loss_history = []
+        self.last_loss = None
+
+        # Collect all valve layers
+        self.valve_layers = []
+        for layer in model.layers_list:
+            if hasattr(layer, 'valves'):
+                self.valve_layers.append(layer)
+
+        # Count total eligible valves for logging
+        self.total_eligible_valves = 0
+        for layer in self.valve_layers:
+            for valve_matrix in layer.valves:
+                self.total_eligible_valves += tf.size(valve_matrix).numpy()
+
+        print(f"  Updater initialized: {self.total_eligible_valves:,} total valve positions")
+        print(f"  Momentum: {momentum}, α₀: {alpha0}, K: {K}")
+
+    def _get_momentum_key(self, layer_idx, valve_idx, i, j):
+        """Generate unique key for momentum storage."""
+        return f"{layer_idx}_{valve_idx}_{i}_{j}"
+
+    def _update_momentum(self, key, gradient):
+        """Update momentum for a specific valve using exponential moving average."""
+        if key not in self.momentums:
+            self.momentums[key] = 0.0
+
+        self.momentums[key] = self.momentum * self.momentums[key] + (1 - self.momentum) * gradient
+        return self.momentums[key]
+
+    def update_schedule(self):
+        """Update all annealing parameters based on current epoch."""
+        # Progress from 0 to 1 over training (assume 30 epochs total)
+        progress = min(1.0, self.epoch / 30)
+
+        # Frequency: linear from initial to max
+        self.current_frequency = int(self.initial_frequency +
+                                     (self.max_frequency - self.initial_frequency) * progress)
+
+        # Temperature: cosine annealing from 1.0 to 0.05 (never reaches 0)
+        self.current_temperature = max(0.05, 0.5 + 0.5 * math.cos(math.pi * progress))
+
+        # Update ratio: exponential decay from 0.3 to 0.02
+        # More natural than linear for momentum updates
+        self.current_update_ratio = 0.3 * (0.5 ** (progress * 4)) + 0.02 * progress
+
+        # Momentum annealing: start lower, increase over time
+        # Early: more exploration, Late: more confidence
+        self.current_momentum = 0.5 + 0.4 * progress  # 0.5 → 0.9
+
+        # Alpha is updated per update, not per epoch (kept separate)
+
+    def update_alpha(self):
+        """Decay learning rate based on number of updates performed."""
+        self.current_alpha = self.alpha0 / (1 + self.update_count / self.K)
+
+    def set_epoch(self, epoch):
+        """Called at the beginning of each epoch to update schedules."""
+        self.epoch = epoch
+        self.batch_in_epoch = 0
+        self.update_schedule()
+
+    def _estimate_gradient_from_loss(self):
+        """Estimate gradient direction from loss history."""
+        if len(self.loss_history) < 2:
+            return 0.0
+
+        # Simple gradient estimate: (loss_prev - loss_curr) / loss_prev
+        # Positive = loss decreasing (good direction)
+        loss_prev = self.loss_history[-2]
+        loss_curr = self.loss_history[-1]
+
+        if loss_prev > 0:
+            return (loss_prev - loss_curr) / loss_prev
+        return 0.0
+
+    def update(self, loss_value):
+        """
+        Perform probabilistic valve updates with momentum.
+
+        Args:
+            loss_value: Current loss value (used as exploration signal)
+        """
+        self.batch_in_epoch += 1
+
+        # Store loss history for gradient estimation
+        self.loss_history.append(loss_value)
+        if len(self.loss_history) > 10:
+            self.loss_history.pop(0)
+
+        # Check if we should update based on current frequency
+        if self.batch_in_epoch % self.current_frequency != 0:
+            return
+
+        # Decay learning rate with each update
+        self.update_alpha()
+
+        # Get global gradient direction from loss
+        global_gradient = self._estimate_gradient_from_loss()
+
+        # Use loss magnitude to scale exploration
+        # Higher loss = more aggressive exploration
+        grad_scale = max(0.05, min(0.5, loss_value * 2))
+
+        total_changes = 0
+        total_considered = 0
+
+        for layer_idx, layer in enumerate(self.valve_layers):
+            for valve_idx, valve_matrix in enumerate(layer.valves):
+                current = valve_matrix.numpy()
+
+                for i in range(layer.units):
+                    for j in range(layer.input_dim):
+                        if current[i, j] == 0:
+                            continue
+
+                        # Skip based on update ratio
+                        if random.random() > self.current_update_ratio:
+                            continue
+
+                        total_considered += 1
+
+                        # Combine global gradient with local randomness
+                        # This creates a noisy gradient estimate with momentum
+                        local_noise = (random.random() - 0.5) * grad_scale
+
+                        # Use momentum from previous updates if available
+                        key = self._get_momentum_key(layer_idx, valve_idx, i, j)
+
+                        # Gradient = global direction + local exploration
+                        raw_gradient = global_gradient + local_noise
+
+                        # Update momentum
+                        momentum_value = self._update_momentum(key, raw_gradient)
+
+                        # Apply momentum to the update
+                        # Higher momentum = more influence from past gradients
+                        effective_gradient = (1 - self.current_momentum) * raw_gradient + \
+                                             self.current_momentum * momentum_value
+
+                        new_valve, updated = self._probabilistic_valve_update(
+                            current[i, j], effective_gradient, self.current_alpha,
+                            self.current_temperature, layer.max_valve
+                        )
+
+                        if updated:
+                            valve_matrix[i, j].assign(new_valve)
+                            total_changes += 1
+
+        self.update_count += 1
+
+        # Log update information
+        if total_changes > 0:
+            print(f"  [Updater] Epoch {self.epoch} (#{self.update_count}): "
+                  f"changed {total_changes}/{total_considered} valves "
+                  f"(α={self.current_alpha:.4f}, T={self.current_temperature:.3f}, "
+                  f"mom={self.current_momentum:.3f}, ratio={self.current_update_ratio:.3f}, "
+                  f"freq={self.current_frequency})")
+
+        self.last_loss = loss_value
+
+    def _probabilistic_valve_update(self, valve_int, gradient, alpha, temperature, max_valve=8):
+        """
+        Compute probabilistic update for a single valve with momentum.
+
+        Args:
+            valve_int: Current valve value (integer, stored as value × 8)
+            gradient: ∂L/∂output gradient for this connection (with momentum)
+            alpha: Current learning rate
+            temperature: Current exploration temperature (clamped above 0)
+            max_valve: Maximum exponent value
+
+        Returns:
+            new_valve_int: Updated valve value (or same if no update)
+            updated: Boolean indicating if update occurred
+        """
+        if valve_int == 0:
+            return valve_int, False
+
+        # Safety clamp temperature
+        temp = max(temperature, 0.05)
+
+        # Convert to exponent
+        x = abs(valve_int) // 8
+        if x == 0:
+            return valve_int, False
+
+        sign = 1 if valve_int > 0 else -1
+
+        # Gradient with momentum now includes accumulated direction
+        if gradient > 0:
+            # Need to increase multiplier
+            prob = min(1.0, alpha * gradient / (x * temp))
+            if random.random() < prob:
+                new_x = min(x * 2, max_valve)
+                new_valve = sign * new_x * 8
+                return new_valve, True
+        elif gradient < 0:
+            # Need to decrease multiplier
+            prob = min(1.0, -2 * alpha * gradient / (x * temp))
+            if random.random() < prob:
+                new_x = max(x // 2, 1)
+                new_valve = sign * new_x * 8
+                return new_valve, True
+
+        return valve_int, False
+
+    def reset_momentum(self):
+        """Reset all momentum accumulators (useful for hyperparameter changes)."""
+        self.momentums = {}
+        print(f"  [Updater] Momentum reset at epoch {self.epoch}")
+
+# ============================================================================
+# DATA LOADING
+# ============================================================================
+
+def load_mnist(batch_size=128):
+    """Load and preprocess MNIST dataset."""
+    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+
+    x_train = x_train.reshape(-1, 784).astype(np.float32)
+    x_test = x_test.reshape(-1, 784).astype(np.float32)
+
+    train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    train_ds = train_ds.shuffle(10000).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test))
+    test_ds = test_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    return train_ds, test_ds
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    print("=" * 70)
+    print("VALVE NETWORK WITH PROBABILISTIC VALVE UPDATES")
+    print("=" * 70)
+
+    BATCH_SIZE = 128
+    EPOCHS = 20
+    LEARNING_RATE = 0.005
+    VALVE_BITS = 4
+    INITIAL_SPARSITY = 0.9
+
+    print("\nLoading MNIST data...")
+    train_ds, test_ds = load_mnist(batch_size=BATCH_SIZE)
+
+    # Build network
+    network = ValveNetwork(
+        input_dim=784,
+        hidden_dims=[256, 128, 64],
+        num_classes=10,
+        valve_bits=VALVE_BITS,
+        initial_sparsity=INITIAL_SPARSITY
+    )
+
+    # Build the network
+    dummy_input = tf.zeros((1, 784))
+    _ = network(dummy_input, training=False)
+
+    # Initial connection optimization pass (training amplifiers only)
+    print("\n" + "=" * 60)
+    print("INITIAL CONNECTION OPTIMIZATION PASS")
+    print("=" * 60)
+
+    temp_optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=0.01)
+
+    for epoch in range(5):
+        train_loss_avg = 0
+        train_acc = 0
+        train_batches = 0
+
+        for batch_x, batch_y in train_ds:
+            # Convert labels to int32 for compatibility
+            batch_y = tf.cast(batch_y, tf.int32)
+
+            with tf.GradientTape() as tape:
+                logits = network(batch_x, training=True)
+                loss = tf.reduce_mean(
+                    tf.keras.losses.sparse_categorical_crossentropy(batch_y, logits, from_logits=True)
+                )
+
+            grads = tape.gradient(loss, network.trainable_variables)
+            temp_optimizer.apply_gradients(zip(grads, network.trainable_variables))
+
+            train_loss_avg += loss.numpy()
+            pred = tf.argmax(logits, axis=1, output_type=tf.int32)
+            train_acc += tf.reduce_mean(tf.cast(tf.equal(pred, batch_y), tf.float32)).numpy()
+            train_batches += 1
+
+        train_loss_avg /= train_batches
+        train_acc /= train_batches
+
+        # Validation
+        val_acc = 0
+        val_batches = 0
+        for batch_x, batch_y in test_ds:
+            batch_y = tf.cast(batch_y, tf.int32)
+            logits = network(batch_x, training=False)
+            pred = tf.argmax(logits, axis=1, output_type=tf.int32)
+            val_acc += tf.reduce_mean(tf.cast(tf.equal(pred, batch_y), tf.float32)).numpy()
+            val_batches += 1
+        val_acc /= val_batches
+
+        print(f"  Opt Epoch {epoch + 1}: Train Acc={train_acc:.4f}, Val Acc={val_acc:.4f}")
+
+    network.get_stats()
+
+    total_trainable = sum(np.prod(v.shape) for v in network.trainable_variables)
+    print(f"Total trainable parameters: {total_trainable:,}")
+
+    # Create probabilistic valve updater with annealed frequency
+    updater = ProbabilisticValveUpdater(
+        model=network,
+        alpha0=0.5,
+        K=3,
+        initial_frequency=20,  # Update every 50 batches initially
+        max_frequency=500,  # Update every 500 batches at the end
+        momentum=0.7
+    )
+
+    # Main optimizer
+    optimizer = tf.keras.optimizers.legacy.Adam(learning_rate=LEARNING_RATE)
+
+    print("\n" + "=" * 60)
+    print("MAIN TRAINING PHASE (Amplifiers + Probabilistic Valve Updates)")
+    print("=" * 60)
+
+    train_accs = []
+    test_accs = []
+    loss_history = []
+
+    for epoch in range(1, EPOCHS + 1):
+        train_loss_avg = 0
+        train_acc = 0
+        train_batches = 0
+
+        updater.set_epoch(epoch)
+
+
+        for batch_x, batch_y in tqdm(train_ds, desc=f"Epoch {epoch}"):
+            batch_y = tf.cast(batch_y, tf.int32)
+
+            with tf.GradientTape() as tape:
+                logits = network(batch_x, training=True)
+                loss = tf.reduce_mean(
+                    tf.keras.losses.sparse_categorical_crossentropy(batch_y, logits, from_logits=True)
+                )
+
+            # Update amplifiers
+            grads = tape.gradient(loss, network.trainable_variables)
+            optimizer.apply_gradients(zip(grads, network.trainable_variables))
+
+            # Probabilistic valve updates
+            updater.update(loss.numpy())
+
+            train_loss_avg += loss.numpy()
+            pred = tf.argmax(logits, axis=1, output_type=tf.int32)
+            train_acc += tf.reduce_mean(tf.cast(tf.equal(pred, batch_y), tf.float32)).numpy()
+            train_batches += 1
+
+        train_loss_avg /= train_batches
+        train_acc /= train_batches
+        loss_history.append(train_loss_avg)
+
+        # Validation
+        val_acc = 0
+        val_batches = 0
+        for batch_x, batch_y in test_ds:
+            batch_y = tf.cast(batch_y, tf.int32)
+            logits = network(batch_x, training=False)
+            pred = tf.argmax(logits, axis=1, output_type=tf.int32)
+            val_acc += tf.reduce_mean(tf.cast(tf.equal(pred, batch_y), tf.float32)).numpy()
+            val_batches += 1
+        val_acc /= val_batches
+
+        train_accs.append(train_acc)
+        test_accs.append(val_acc)
+
+        print(f"Epoch {epoch:2d}: Loss={train_loss_avg:.4f}, Train Acc={train_acc:.4f}, Test Acc={val_acc:.4f}")
+
+        if epoch % 10 == 0:
+            network.get_stats()
+
+    # Plot results
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(range(1, EPOCHS + 1), train_accs, 'b-', label='Train Accuracy', linewidth=2)
+    ax1.plot(range(1, EPOCHS + 1), test_accs, 'r-', label='Test Accuracy', linewidth=2)
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Accuracy')
+    ax1.set_title('Training and Test Accuracy')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim([0.5, 1.0])
+
+    ax2.plot(range(1, EPOCHS + 1), loss_history, 'g-', linewidth=2)
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Loss')
+    ax2.set_title('Training Loss')
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('valve_network_results.png', dpi=150)
+    plt.show()
+
+    print("\n" + "=" * 60)
+    print(f"Best Test Accuracy: {max(test_accs):.4f} ({max(test_accs) * 100:.2f}%)")
+    print("=" * 60)
+
+    network.get_stats()
+
+    return network, train_accs, test_accs, loss_history
+
+
+if __name__ == "__main__":
+    network, train_accs, test_accs, loss_history = main()
