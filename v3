@@ -1,0 +1,421 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import numpy as np
+from tqdm import tqdm
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+
+# ============================================================================
+# VALVE LAYER WITH LOCAL STATISTICAL UPDATES
+# ============================================================================
+
+class ValveLayer(nn.Module):
+    """
+    Layer with 2-bit valves updated via local statistics.
+    Valves = {-1, 0, 1, 2} - routing only (no multipliers needed)
+    """
+
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Initialize valves randomly with distribution: 70% zeros, 10% each for -1,1,2
+        init_vals = []
+        for _ in range(out_features * in_features):
+            r = np.random.random()
+            if r < 0.7:
+                init_vals.append(0.0)
+            elif r < 0.8:
+                init_vals.append(-1.0)
+            elif r < 0.9:
+                init_vals.append(1.0)
+            else:
+                init_vals.append(2.0)
+
+        init_tensor = torch.tensor(init_vals, dtype=torch.float32).reshape(out_features, in_features)
+        self.valves = nn.Parameter(init_tensor, requires_grad=False)  # Not trainable via backprop!
+
+        # Counters for local statistical updates
+        self.register_buffer('counters_m1', torch.zeros(out_features, in_features))
+        self.register_buffer('counters_0', torch.zeros(out_features, in_features))
+        self.register_buffer('counters_1', torch.zeros(out_features, in_features))
+        self.register_buffer('counters_2', torch.zeros(out_features, in_features))
+        self.register_buffer('update_counter', torch.zeros(out_features, in_features))
+
+        self.threshold = 100  # Number of samples before committing change
+
+    def forward(self, x):
+        """
+        Forward pass: routing only (3-group accumulation)
+        x: (batch, in_features)
+        returns: (batch, out_features)
+        """
+        # Create masks for each valve value
+        mask_m1 = (self.valves == -1).float()
+        mask_1 = (self.valves == 1).float()
+        mask_2 = (self.valves == 2).float()
+
+        # 3-group accumulation (no multipliers!)
+        sum_m1 = torch.matmul(x, mask_m1.T)
+        sum_1 = torch.matmul(x, mask_1.T)
+        sum_2 = torch.matmul(x, mask_2.T)
+
+        S = -sum_m1 + sum_1 + 2 * sum_2
+
+        # Count non-zero valves per neuron
+        n_nonzero = (mask_m1.sum(dim=1) + mask_1.sum(dim=1) + mask_2.sum(dim=1))
+        n_nonzero = n_nonzero.unsqueeze(0).clamp(min=1)
+
+        return S / n_nonzero
+
+    def local_statistical_update(self, src_output, target_gradient, lr=0.01):
+        """
+        Local statistical update for valves.
+
+        Args:
+            src_output: (batch, in_features) - output from previous layer
+            target_gradient: (batch, out_features) - ∂Loss/∂S for this layer's neurons
+        """
+        batch_size = src_output.shape[0]
+
+        # For each connection, evaluate benefit of each valve value
+        for i in range(self.out_features):  # target neuron
+            for j in range(self.in_features):  # source neuron
+                # Get current valve value
+                current = self.valves[i, j].item()
+
+                # Source output across batch (need to consider effect)
+                src_vals = src_output[:, j]  # (batch,)
+                grad_vals = target_gradient[:, i]  # (batch,)
+
+                # For each possible valve value
+                for new_val in [-1, 0, 1, 2]:
+                    if new_val == current:
+                        continue
+
+                    # Local change in total input for this connection
+                    # ΔS = src_output × (new_val - current)
+                    delta_S = src_vals * (new_val - current)
+
+                    # Approximated change in loss (local approximation)
+                    # ΔLoss ≈ Σ (∂Loss/∂S × ΔS)
+                    delta_loss = (grad_vals * delta_S).mean()
+
+                    # Update counter based on sign
+                    if delta_loss < 0:  # Loss decreases
+                        if new_val == -1:
+                            self.counters_m1[i, j] += 1
+                        elif new_val == 0:
+                            self.counters_0[i, j] += 1
+                        elif new_val == 1:
+                            self.counters_1[i, j] += 1
+                        elif new_val == 2:
+                            self.counters_2[i, j] += 1
+                    else:  # Loss increases
+                        if new_val == -1:
+                            self.counters_m1[i, j] -= 1
+                        elif new_val == 0:
+                            self.counters_0[i, j] -= 1
+                        elif new_val == 1:
+                            self.counters_1[i, j] -= 1
+                        elif new_val == 2:
+                            self.counters_2[i, j] -= 1
+
+                # Increment update counter
+                self.update_counter[i, j] += 1
+
+                # Commit change if threshold reached
+                if self.update_counter[i, j] >= self.threshold:
+                    # Find best valve value
+                    counters = {
+                        -1: self.counters_m1[i, j].item(),
+                        0: self.counters_0[i, j].item(),
+                        1: self.counters_1[i, j].item(),
+                        2: self.counters_2[i, j].item()
+                    }
+                    best_valve = max(counters, key=counters.get)
+
+                    # Apply change
+                    self.valves.data[i, j] = best_valve
+
+                    # Reset counters
+                    self.counters_m1[i, j] = 0
+                    self.counters_0[i, j] = 0
+                    self.counters_1[i, j] = 0
+                    self.counters_2[i, j] = 0
+                    self.update_counter[i, j] = 0
+
+    def get_stats(self):
+        """Print valve distribution"""
+        total = self.valves.numel()
+        for val in [-1, 0, 1, 2]:
+            count = (self.valves == val).sum().item()
+            print(f"    {val:2d}: {100.0 * count / total:5.1f}%")
+
+
+# ============================================================================
+# NEURON LAYER WITH AMPLIFIERS (TRAINED VIA BACKPROP)
+# ============================================================================
+
+class NeuronLayer(nn.Module):
+    """
+    Neuron layer with:
+    - Valve routing (2-bit, local statistical updates)
+    - Input amplifier (continuous, backprop)
+    - Bias (continuous, backprop)
+    - Output amplifier (continuous, backprop)
+    """
+
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.valve_layer = ValveLayer(in_features, out_features)
+
+        # Continuous amplifiers (trained via backprop)
+        self.weight_in = nn.Parameter(torch.ones(out_features))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.weight_out = nn.Parameter(torch.ones(out_features))
+
+    def forward(self, x):
+        # Routing (valves)
+        routed = self.valve_layer(x)
+
+        # Input amplification
+        scaled = routed * self.weight_in.unsqueeze(0)
+
+        # Bias
+        biased = scaled + self.bias.unsqueeze(0)
+
+        # Activation
+        activated = torch.tanh(biased)
+
+        # Output amplification
+        output = activated * self.weight_out.unsqueeze(0)
+
+        # Scale to 16-bit range
+        output = output * 32767
+
+        return output
+
+    def local_statistical_update(self, src_output, target_gradient):
+        """Update valves using local statistics"""
+        self.valve_layer.local_statistical_update(src_output, target_gradient)
+
+    def get_stats(self):
+        print(f"    Valves:")
+        self.valve_layer.get_stats()
+        print(f"    weight_in: mean={self.weight_in.mean().item():.4f}, std={self.weight_in.std().item():.4f}")
+        print(f"    weight_out: mean={self.weight_out.mean().item():.4f}, std={self.weight_out.std().item():.4f}")
+        print(f"    bias: mean={self.bias.mean().item():.4f}, std={self.bias.std().item():.4f}")
+
+
+# ============================================================================
+# SIMPLE LINEAR NETWORK
+# ============================================================================
+
+class ValveNetwork(nn.Module):
+    """
+    Simple linear network with:
+    - Valve layers (2-bit, local statistical updates)
+    - Amplifiers (continuous, backprop)
+    """
+
+    def __init__(self, input_dim=784, hidden_dims=[256, 128, 64], num_classes=10):
+        super().__init__()
+
+        self.layers = nn.ModuleList()
+        prev_dim = input_dim
+
+        for i, dim in enumerate(hidden_dims):
+            self.layers.append(NeuronLayer(prev_dim, dim))
+            prev_dim = dim
+
+        # Final classifier (no valves, just linear)
+        self.classifier = nn.Linear(prev_dim, num_classes)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = (x - 0.5) * 2  # Normalize to [-1, 1]
+
+        # Store intermediate outputs for valve updates
+        self.intermediate_outputs = [x]
+
+        for layer in self.layers:
+            x = layer(x)
+            self.intermediate_outputs.append(x)
+
+        # Final classifier (scale down from 16-bit range)
+        x = x / 32767.0
+        logits = self.classifier(x)
+
+        return logits
+
+    def local_statistical_update(self, gradients):
+        """
+        Update valves using local statistics.
+
+        Args:
+            gradients: List of ∂Loss/∂S for each layer (from backprop)
+        """
+        # For each layer, use its input and output gradient
+        for i, layer in enumerate(self.layers):
+            src_output = self.intermediate_outputs[i]  # Input to this layer
+            target_gradient = gradients[i]  # ∂Loss/∂S for this layer's output
+            layer.local_statistical_update(src_output, target_gradient)
+
+    def get_stats(self):
+        print("\n" + "=" * 60)
+        print("Network Statistics")
+        print("=" * 60)
+        for i, layer in enumerate(self.layers):
+            print(f"\nLayer {i}:")
+            layer.get_stats()
+        print("=" * 60 + "\n")
+
+
+# ============================================================================
+# TRAINING WITH HYBRID UPDATES
+# ============================================================================
+
+def compute_gradients(model, loss):
+    """
+    Compute gradients for all parameters and also return ∂Loss/∂S for each layer.
+    """
+    # Standard backprop
+    loss.backward()
+
+    # Extract gradients for each layer's output (before activation)
+    gradients = []
+    for layer in model.layers:
+        # ∂Loss/∂S = ∂Loss/∂output × ∂output/∂S
+        # output = tanh(weight_in * routed + bias) * weight_out * 32767
+        # ∂output/∂S = weight_in * (1 - tanh²(...)) * weight_out * 32767
+
+        routed = layer.valve_layer(model.intermediate_outputs[model.layers.index(layer)])
+        S = routed  # This is the value before input amplification
+
+        # For simplicity, we approximate gradient from downstream
+        # In practice, you'd compute this properly
+        grad = torch.ones_like(routed)  # Placeholder
+        gradients.append(grad)
+
+    return gradients
+
+
+def train_epoch(model, train_loader, optimizer, epoch, valve_update_freq=10):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
+    for batch_idx, (data, target) in enumerate(pbar):
+        data, target = data.cuda() if torch.cuda.is_available() else data, target
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        output = model(data)
+        loss = F.cross_entropy(output, target)
+
+        # Standard backprop for amplifiers
+        loss.backward()
+
+        # Update amplifiers via optimizer
+        optimizer.step()
+
+        # Every few batches, update valves via local statistics
+        if batch_idx % valve_update_freq == 0:
+            # Need gradients ∂Loss/∂S for each layer
+            # For now, we use a simplified approximation
+            with torch.no_grad():
+                # Compute gradients for each layer's output
+                grad_output = torch.autograd.grad(loss, model.intermediate_outputs[1:],
+                                                  retain_graph=True, allow_unused=True)
+                model.local_statistical_update(grad_output)
+
+        total_loss += loss.item()
+        pred = output.argmax(dim=1)
+        correct += pred.eq(target).sum().item()
+        total += target.size(0)
+
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'acc': f'{100. * correct / total:.1f}%'
+        })
+
+    return total_loss / len(train_loader), 100. * correct / total
+
+
+def evaluate(model, test_loader):
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.cuda() if torch.cuda.is_available() else data, target
+            output = model(data)
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += target.size(0)
+
+    return 100. * correct / total
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Data
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+
+    train_ds = datasets.MNIST('./data', train=True, download=True, transform=transform)
+    test_ds = datasets.MNIST('./data', train=False, transform=transform)
+
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
+
+    # Model
+    model = ValveNetwork().to(device)
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Initial stats
+    model.get_stats()
+
+    # Optimizer for amplifiers only (valves not trainable via backprop)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    print("\nStarting training...")
+    print("=" * 60)
+
+    for epoch in range(1, 21):
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, epoch, valve_update_freq=10)
+        test_acc = evaluate(model, test_loader)
+
+        print(f"\nEpoch {epoch}: Train Acc: {train_acc:.2f}%, Test Acc: {test_acc:.2f}%")
+        print("-" * 60)
+
+        if epoch % 5 == 0:
+            model.get_stats()
+
+    print(f"\nBest Test Accuracy: {max(test_acc):.2f}%")
+
+    return model
+
+
+if __name__ == "__main__":
+    model = main()
